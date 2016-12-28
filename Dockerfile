@@ -1,63 +1,86 @@
-FROM debian
+FROM alpine:3.4
 
-# add our user and group first to make sure their IDs get assigned consistently, regardless of whatever dependencies get added
-RUN groupadd -r mysql && useradd -r -g mysql mysql
-
-# add gosu for easy step-down from root
-ENV GOSU_VERSION 1.7
+# ensure www-data user exists
 RUN set -x \
-	&& apt-get update && apt-get install -y --no-install-recommends ca-certificates wget && rm -rf /var/lib/apt/lists/* \
-	&& wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$(dpkg --print-architecture)" \
-	&& wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$(dpkg --print-architecture).asc" \
+	&& addgroup -g 82 -S www-data \
+	&& adduser -u 82 -D -S -G www-data www-data
+# 82 is the standard uid/gid for "www-data" in Alpine
+# http://git.alpinelinux.org/cgit/aports/tree/main/apache2/apache2.pre-install?h=v3.3.2
+# http://git.alpinelinux.org/cgit/aports/tree/main/lighttpd/lighttpd.pre-install?h=v3.3.2
+# http://git.alpinelinux.org/cgit/aports/tree/main/nginx-initscripts/nginx-initscripts.pre-install?h=v3.3.2
+
+ENV HTTPD_PREFIX /usr/local/apache2
+ENV PATH $HTTPD_PREFIX/bin:$PATH
+RUN mkdir -p "$HTTPD_PREFIX" \
+	&& chown www-data:www-data "$HTTPD_PREFIX"
+WORKDIR $HTTPD_PREFIX
+
+ENV HTTPD_VERSION 2.4.23
+ENV HTTPD_SHA1 5101be34ac4a509b245adb70a56690a84fcc4e7f
+
+# https://issues.apache.org/jira/browse/INFRA-8753?focusedCommentId=14735394#comment-14735394
+ENV HTTPD_BZ2_URL https://www.apache.org/dyn/closer.cgi?action=download&filename=httpd/httpd-$HTTPD_VERSION.tar.bz2
+# not all the mirrors actually carry the .asc files :'(
+ENV HTTPD_ASC_URL https://www.apache.org/dist/httpd/httpd-$HTTPD_VERSION.tar.bz2.asc
+
+# see https://httpd.apache.org/docs/2.4/install.html#requirements
+RUN set -x \
+	&& runDeps=' \
+		apr-dev \
+		apr-util-dev \
+		perl \
+	' \
+	&& apk add --no-cache --virtual .build-deps \
+		$runDeps \
+		ca-certificates \
+		gcc \
+		gnupg \
+		libc-dev \
+		make \
+		openssl \
+		openssl-dev \
+		pcre-dev \
+		tar \
+	\
+	&& wget -O httpd.tar.bz2 "$HTTPD_BZ2_URL" \
+	&& echo "$HTTPD_SHA1 *httpd.tar.bz2" | sha1sum -c - \
+# see https://httpd.apache.org/download.cgi#verify
+	&& wget -O httpd.tar.bz2.asc "$HTTPD_ASC_URL" \
 	&& export GNUPGHOME="$(mktemp -d)" \
-	&& gpg --keyserver ha.pool.sks-keyservers.net --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4 \
-	&& gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu \
-	&& rm -r "$GNUPGHOME" /usr/local/bin/gosu.asc \
-	&& chmod +x /usr/local/bin/gosu \
-	&& gosu nobody true \
-	&& apt-get purge -y --auto-remove ca-certificates wget
+	&& gpg --keyserver ha.pool.sks-keyservers.net --recv-keys A93D62ECC3C8EA12DB220EC934EA76E6791485A8 \
+	&& gpg --batch --verify httpd.tar.bz2.asc httpd.tar.bz2 \
+	&& rm -r "$GNUPGHOME" httpd.tar.bz2.asc \
+	\
+	&& mkdir -p src \
+	&& tar -xvf httpd.tar.bz2 -C src --strip-components=1 \
+	&& rm httpd.tar.bz2 \
+	&& cd src \
+	\
+	&& ./configure \
+		--prefix="$HTTPD_PREFIX" \
+		--enable-mods-shared=reallyall \
+	&& make -j"$(getconf _NPROCESSORS_ONLN)" \
+	&& make install \
+	\
+	&& cd .. \
+	&& rm -r src \
+	\
+	&& sed -ri \
+		-e 's!^(\s*CustomLog)\s+\S+!\1 /proc/self/fd/1!g' \
+		-e 's!^(\s*ErrorLog)\s+\S+!\1 /proc/self/fd/2!g' \
+		"$HTTPD_PREFIX/conf/httpd.conf" \
+	\
+	&& runDeps="$runDeps $( \
+		scanelf --needed --nobanner --recursive /usr/local \
+			| awk '{ gsub(/,/, "\nso:", $2); print "so:" $2 }' \
+			| sort -u \
+			| xargs -r apk info --installed \
+			| sort -u \
+	)" \
+	&& apk add --virtual .httpd-rundeps $runDeps \
+	&& apk del .build-deps
 
-RUN mkdir /docker-entrypoint-initdb.d
+COPY httpd-foreground /usr/local/bin/
 
-# FATAL ERROR: please install the following Perl modules before executing /usr/local/mysql/scripts/mysql_install_db:
-# File::Basename
-# File::Copy
-# Sys::Hostname
-# Data::Dumper
-RUN apt-get update && apt-get install -y perl pwgen --no-install-recommends && rm -rf /var/lib/apt/lists/*
-
-# gpg: key 5072E1F5: public key "MySQL Release Engineering <mysql-build@oss.oracle.com>" imported
-RUN apt-key adv --keyserver ha.pool.sks-keyservers.net --recv-keys A4A9406876FCBD3C456770C88C718D3B5072E1F5
-
-ENV MYSQL_MAJOR 8.0
-ENV MYSQL_VERSION 8.0.0-dmr-1debian8
-
-RUN echo "deb http://repo.mysql.com/apt/debian/ jessie mysql-${MYSQL_MAJOR}" > /etc/apt/sources.list.d/mysql.list
-
-# the "/var/lib/mysql" stuff here is because the mysql-server postinst doesn't have an explicit way to disable the mysql_install_db codepath besides having a database already "configured" (ie, stuff in /var/lib/mysql/mysql)
-# also, we set debconf keys to make APT a little quieter
-RUN { \
-		echo mysql-community-server mysql-community-server/data-dir select ''; \
-		echo mysql-community-server mysql-community-server/root-pass password ''; \
-		echo mysql-community-server mysql-community-server/re-root-pass password ''; \
-		echo mysql-community-server mysql-community-server/remove-test-db select false; \
-	} | debconf-set-selections \
-	&& apt-get update && apt-get install -y mysql-server="${MYSQL_VERSION}" && rm -rf /var/lib/apt/lists/* \
-	&& rm -rf /var/lib/mysql && mkdir -p /var/lib/mysql /var/run/mysqld \
-	&& chown -R mysql:mysql /var/lib/mysql /var/run/mysqld \
-# ensure that /var/run/mysqld (used for socket and lock files) is writable regardless of the UID our mysqld instance ends up having at runtime
-	&& chmod 777 /var/run/mysqld
-
-# comment out a few problematic configuration values
-# don't reverse lookup hostnames, they are usually another container
-RUN sed -Ei 's/^(bind-address|log)/#&/' /etc/mysql/mysql.conf.d/mysqld.cnf \
-	&& echo '[mysqld]\nskip-host-cache\nskip-name-resolve' > /etc/mysql/conf.d/docker.cnf
-
-VOLUME /var/lib/mysql
-
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN ln -s usr/local/bin/docker-entrypoint.sh /entrypoint.sh # backwards compat
-ENTRYPOINT ["docker-entrypoint.sh"]
-
-EXPOSE 3306
-CMD ["mysqld"]
+EXPOSE 80
+CMD ["httpd-foreground"]
